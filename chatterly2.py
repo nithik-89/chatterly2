@@ -1,107 +1,175 @@
-# chatterly.py
-
-from flask import Flask, render_template_string, request, redirect, url_for, flash, g
-from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
+from flask import Flask, request, redirect, url_for, render_template_string, session, g
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 import sqlite3
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
 import os
 
+# ---------------- Flask setup ----------------
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "super-secret-key")
-
+app.secret_key = "supersecretkey"
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "login"
 
-DB_PATH = "chat.db"  # For demo; switch to PostgreSQL for production
+DB_FILE = "chat.db"
 
+# ---------------- Database setup ----------------
 def get_db():
     db = getattr(g, "_db", None)
     if db is None:
-        db = g._db = sqlite3.connect(DB_PATH)
+        db = g._db = sqlite3.connect(DB_FILE)
         db.row_factory = sqlite3.Row
     return db
 
 def init_db():
-    db = get_db()
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE,
-        password TEXT,
-        username TEXT,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender_id INTEGER,
-        receiver_id INTEGER,
-        content TEXT,
-        created_at TEXT
-    );
-    """)
-    db.commit()
+    with app.app_context():
+        db = get_db()
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )""")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            receiver TEXT NOT NULL,
+            message TEXT NOT NULL
+        )""")
+        db.commit()
 
 @app.teardown_appcontext
-def close_db(exc):
+def close_connection(exception):
     db = getattr(g, "_db", None)
-    if db:
+    if db is not None:
         db.close()
 
+# ---------------- User class ----------------
 class User(UserMixin):
-    def __init__(self, row):
-        self.id = row["id"]
-        self.email = row["email"]
-        self.username = row["username"]
+    def __init__(self, id_, username):
+        self.id = id_
+        self.username = username
 
 @login_manager.user_loader
 def load_user(user_id):
     db = get_db()
-    row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    return User(row) if row else None
+    user = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if user:
+        return User(user['id'], user['username'])
+    return None
 
-BASE_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Chatterly</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-<style>
-body { padding-top: 70px; }
-.messages { height: 300px; overflow:auto; border:1px solid #ccc; padding:10px; background:#f8f9fa; border-radius:5px; }
-.msg { margin-bottom:8px; }
-.username { font-weight:600; }
-</style>
-</head>
-<body>
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">
-<div class="container-fluid">
-  <a class="navbar-brand" href="{{ url_for('index') }}">Chatterly</a>
-  <div class="collapse navbar-collapse">
-    <ul class="navbar-nav ms-auto">
-      {% if current_user.is_authenticated %}
-        <li class="nav-item"><span class="nav-link">Hi, {{ current_user.username or current_user.email }}</span></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
-      {% else %}
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('register') }}">Register</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
-      {% endif %}
+# ---------------- Routes ----------------
+@app.route('/')
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for('chat'))
+    return redirect(url_for('login'))
+
+# ---------- Register ----------
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        db = get_db()
+        try:
+            db.execute("INSERT INTO users(username,password) VALUES(?,?)", (username, password))
+            db.commit()
+            return redirect(url_for('login'))
+        except:
+            return "<h3>Username already exists. Try again.</h3>"
+    return render_template_string('''
+    <h1>Chatterly - Register</h1>
+    <form method="post">
+      Username: <input type="text" name="username" required><br>
+      Password: <input type="password" name="password" required><br>
+      <input type="submit" value="Register">
+    </form>
+    <p>Already have an account? <a href="/login">Login</a></p>
+    ''')
+
+# ---------- Login ----------
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        db = get_db()
+        user = db.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password)).fetchone()
+        if user:
+            login_user(User(user['id'], user['username']))
+            return redirect(url_for('chat'))
+        return "<h3>Invalid credentials. Try again.</h3>"
+    return render_template_string('''
+    <h1>Chatterly - Login</h1>
+    <form method="post">
+      Username: <input type="text" name="username" required><br>
+      Password: <input type="password" name="password" required><br>
+      <input type="submit" value="Login">
+    </form>
+    <p>Don't have an account? <a href="/register">Register</a></p>
+    ''')
+
+# ---------- Logout ----------
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+# ---------- Chat ----------
+@app.route('/chat', methods=['GET', 'POST'])
+@login_required
+def chat():
+    db = get_db()
+    users = db.execute("SELECT username FROM users WHERE username!=?", (current_user.username,)).fetchall()
+    users = [u['username'] for u in users]
+
+    chat_with = request.args.get('user')
+    messages = []
+    if chat_with:
+        messages = db.execute(
+            "SELECT * FROM messages WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?) ORDER BY id",
+            (current_user.username, chat_with, chat_with, current_user.username)
+        ).fetchall()
+
+    if request.method == 'POST':
+        msg = request.form['message']
+        receiver = request.form['receiver']
+        if msg and receiver:
+            db.execute("INSERT INTO messages(sender,receiver,message) VALUES(?,?,?)",
+                       (current_user.username, receiver, msg))
+            db.commit()
+            return redirect(url_for('chat', user=receiver))
+
+    return render_template_string('''
+    <h1>Chatterly - Chat</h1>
+    <p>Logged in as {{current_user.username}} | <a href="/logout">Logout</a></p>
+    <h3>Users:</h3>
+    <ul>
+    {% for user in users %}
+      <li><a href="{{url_for('chat', user=user)}}">{{user}}</a></li>
+    {% endfor %}
     </ul>
-  </div>
-</div>
-<div class="container mt-5">
-"""
 
-# --- Routes (same as previous version) ---
-# index, register, login, logout, chat routes remain unchanged
-# For brevity, you can copy all route code from the previous single-file version
+    {% if chat_with %}
+      <h3>Chat with {{chat_with}}</h3>
+      <div style="border:1px solid #000;padding:10px;height:300px;overflow-y:scroll;">
+      {% for m in messages %}
+        <p><b>{{m['sender']}}:</b> {{m['message']}}</p>
+      {% endfor %}
+      </div>
+      <form method="post">
+        <input type="hidden" name="receiver" value="{{chat_with}}">
+        <input type="text" name="message" placeholder="Type your message" required>
+        <input type="submit" value="Send">
+      </form>
+    {% else %}
+      <p>Select a user to start chatting.</p>
+    {% endif %}
+    ''', users=users, chat_with=chat_with, messages=messages)
 
-# --- Run App ---
-if __name__=="__main__":
-    with app.app_context():
-        init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# ---------------- Run App ----------------
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=10000, debug=True)
